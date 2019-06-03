@@ -1,0 +1,145 @@
+\documentclass{article}
+%% Change fonts to something friendly to acrobat
+%%
+%\usepackage{courier}
+%\usepackage{times,mathptmx}
+%\DeclareMathAlphabet{\bm}{OT1}{ptm}{b}{it}
+\usepackage{graphicx}
+\usepackage{amsmath} % used for extended formula formatting tools
+\usepackage{amssymb}
+\usepackage{theorem}
+\usepackage{euscript}
+
+\topmargin  0.0in
+\headheight  0.15in
+\headsep  0.15in
+\footskip  0.2in
+\textheight 8.45in
+
+\oddsidemargin 0.56in
+\evensidemargin \oddsidemargin
+\textwidth 5.8in
+
+\pagestyle{myheadings}
+\markright{\bf Sponge Layer Module User Guide}
+
+\begin{document}
+
+
+\title{Sponge Layer Module User Guide.}
+
+\author{ Michael Nucci }
+
+\maketitle
+\section{Sponge Layer}
+
+The governing flow equations in Loci/CHEM are shown below. The source term $\Dot{W}$ is zero for nonreacting flow, and contains the species sources for reacting flow.
+
+\begin{equation}
+\frac{d}{dt} \int_{\Omega_c(t)} Q ~dV +
+\int_{{\partial\Omega_c}(t)} (F_i-F_v) ~dS =
+\int_{\Omega_c(t)} \Dot{W} ~dV,
+\label{gov_integral}
+\end{equation}
+
+The sponge layer model \cite{Mani} augments the source term $\Dot{W}$ as shown below. These source terms attempt to drive the flow to a user defined reference state. The damping coefficient $\sigma$ is an inverse time scale and determines the strength of the sponge.
+
+\begin{equation}
+\dot{W} =
+\begin{bmatrix}
+\sigma \left( \rho_{1_{ref}} - \rho_1 \right) \\
+\vdots \\
+\sigma \left( \rho_{s_{ref}} - \rho_s \right)\\
+\vdots \\
+\sigma \left( \rho_{{\mathbf{NS}}_{ref}} - \rho_{\mathbf{NS}} \right) \\
+\sigma \left(\rho_{ref} \Tilde{u}_{ref} - \rho \Tilde{u} \right) \\
+\sigma \left(\rho_{ref} e_{0_{ref}} - \rho e_0 \right)
+\end{bmatrix}
+\end{equation}
+
+The value of $\sigma$ varies throughout the domain as a function of the distance to the nearest sponge boundary $D_s$, the length of the sponge layer $l_s$, and the maximum value of $\sigma_{max}$.
+
+\begin{equation}
+\sigma =
+\begin{cases}
+  \sigma_{max} \left( 1 - \frac{D_s}{l_s}\right),& \text{if } D_s < l_s \\
+  0,& \text{otherwise}
+\end{cases}
+\end{equation}
+
+\section{Sponge Layer Module Usage}
+
+To access the sponge layer model, load the {\tt sponge} module.
+
+\begin{verbatim}
+loadModule: sponge
+\end{verbatim}
+
+Boundary conditions that allow outflow ({\tt outflow, outflowNRBC, extrapolate, farfield, supersonicOutflow, fixedMassOutflow}) may be augmented with the {\tt sponge} tag.
+
+\subsection{Sponge Layer Inputs}
+
+The {\tt sponge} module has several inputs that may be specified inside of the {\tt sponge} options list.
+
+  \begin{list}{}{}
+
+  \item {\tt p, T, rho}
+
+    Two of pressure, temperature, and density must set. These scalar variables help to form the reference flow state that the sponge layer is trying to reach.
+    
+  \item {\tt u, M}
+  
+    One of either velocity or Mach number must be set. This vector variable helps to form the reference flow state that the sponge layer is trying to reach.
+  
+  \item {\tt length}
+     
+    This required input specifies the region of influence for the sponge layer, $l_s$. The sponge layer will be active in regions that are closer to a boundary condition with the {\tt sponge} tag than this value.
+    
+  \item {\tt sigma}
+  
+	This optional variable is used to specify the maximum value of {\tt $\sigma$}, the parameter determining the sponge strength. This input is optional and the default value is {\tt 1.0}.
+
+  \end{list}
+
+An example input for a simulation using the sponge layer is shown below.
+
+\begin{verbatim}
+	// tag boundary that permits outflow as a sponge
+	boundary_conditions: <BC_1=outflow(p=101300 Pa, sponge), ...>
+	      
+	// sponge layer setup
+	sponge: <p=101300 Pa, T=300 K, u=[100 m/s, 0,0], length=0.1 m, sigma=50000>
+\end{verbatim}
+
+
+\subsection{Sponge Layer Outputs}
+
+Loading the {\tt sponge} module provides the option for outputting some variables associated with the sponge layer calculations. To output any of the following variables, add them to the \verb!plot_output! variable in the {\tt .vars} file.
+
+  \begin{list}{}{}
+  	
+  	
+  	\item {\tt spongeDistance}
+  	
+  	The distance to the nearest boundary marked with the {\tt sponge} tag.
+  	
+  	\item {\tt spongeSigma}
+  	
+  	The local value of the {\tt $\sigma$} parameter controlling the sponge layer strength.
+  	
+  \end{list}
+
+
+\clearpage
+
+
+
+\bibliographystyle{abbrv}
+\bibliography{references}
+
+
+\end{document}
+
+
+
+

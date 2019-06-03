@@ -1,0 +1,217 @@
+// Copyright (C) 2019, ATA Engineering, Inc.
+// 
+// This program is free software; you can redistribute it and/or
+// modify it under the terms of the GNU Lesser General Public
+// License as published by the Free Software Foundation; either
+// version 3 of the License, or (at your option) any later version.
+// 
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+// Lesser General Public License for more details.
+// 
+// You should have received a copy of the GNU Lesser General Public License
+// along with this program; if not, write to the Free Software Foundation,
+// Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.
+
+
+#include <Loci.h>
+#include <iostream>
+#include <string>
+
+$include "chem.lh"
+#include "eos.h"
+#include "bctools.h"
+#include "read_grid.h"
+$include "sponge.lh"
+
+namespace chem {
+
+  // bc check for outflow boundaries
+  class sponge_bc_check : public BC_Check {
+    string error_message;
+
+   public:
+    std::string boundaryConditions() { 
+      return "fixedMassOutflow,supersonicOutflow,extrapolate,farfield,outflow,outflowNRBC"; 
+    }
+    std::string variablesChecked() { return "sponge"; }
+
+    bool checkOptions(const options_list &bc_options) {
+      error_message = "";
+      return true;
+    }
+    std::ostream &ErrorMessage(std::ostream &s) {
+      s << error_message << endl;
+      return s;
+    }
+  };
+
+  register_BC<sponge_bc_check> register_BC_sponge_bc_check;
+
+  // --------------------------------------------------------------------------
+
+  // rule for sponge input in vars file - default to empty
+  $rule default(sponge) { $sponge = options_list(""); }
+  
+  // get sponge data from vars file
+  // input should look like the following
+  // sponge: <p=1 atm, T=300 K, M=[0.5, 0, 0], sigma=1 /s, length=0.1 m>
+  $rule singleton(spongeRhoRef, spongeMixRef, spongeVelRef, spongeEnergyRef,
+                  spongeLength, spongeSigmaMax <- sponge, eos, 
+                  defaultMixtureFraction, qvi, numSpecies) {
+    // -----------------------------------------------------------------
+    if ($sponge.optionExists("length")) {
+      $sponge.getOptionUnits("length", "m", $spongeLength);
+    } else {
+      std::cerr << "ERROR: must specify 'length' for sponge" << std::endl;
+      Loci::Abort();
+    }
+
+    // -----------------------------------------------------------------
+    if ($sponge.optionExists("sigma")) {
+      $sponge.getOptionUnits("sigma", "1/s", $spongeSigmaMax);
+    } else {
+      $spongeSigmaMax = 1.0;  // default value
+    }
+
+    // -----------------------------------------------------------------
+    // get sponge reference state
+    // sanity check for thermodynamic variables
+    int thermoCount = 0;
+    bool haveRho = false;
+    if ($sponge.optionExists("rho")) {
+      thermoCount++;
+      haveRho = true;
+      $sponge.getOptionUnits("rho", "kg/m/m/m", $spongeRhoRef);
+    }
+    bool havePressure = false;
+    real spongePressure = 0.0;
+    if ($sponge.optionExists("p")) {
+      thermoCount++;
+      havePressure = true;
+      $sponge.getOptionUnits("p", "Pa", spongePressure);
+    }
+    bool haveTemperature = false;
+    real spongeTemperature = 0.0;
+    if ($sponge.optionExists("T")) {
+      thermoCount++;
+      haveTemperature = true;
+      $sponge.getOptionUnits("T", "K", spongeTemperature);
+    }
+    if (thermoCount != 2) {
+      std::cerr << "ERROR: must specify two and only two of 'rho', 'p', and "
+                   "'T' for sponge"
+                << std::endl;
+      Loci::Abort();
+    }
+    // sanity check for mach / velocity
+    vect3d spongeMach(0.0, 0.0, 0.0);
+    bool haveVelocity = false;
+    Loci::options_list::arg_list alist;
+    if ($sponge.optionExists("M")) {
+      if (!check_vector_units($sponge, "M", "")) {
+        std::cerr << "ERROR: 'M' should have no units" << std::endl;
+        Loci::Abort();
+      }
+      $sponge.getOption("M", alist);
+      if (alist.size() != 3) {
+        std::cerr << "ERROR: 'M' should be of size 3" << std::endl;
+        Loci::Abort();
+      }
+      real component[3];
+      for (unsigned int ii = 0; ii < alist.size(); ++ii) {
+        if (alist[ii].type_of() != Loci::REAL) {
+          std::cerr << "ERROR in specification of 'M'" << std::endl;
+          Loci::Abort();
+        }
+        alist[ii].get_value(component[ii]);
+      }
+      spongeMach = vect3d(component[0], component[1], component[2]);
+    } else if ($sponge.optionExists("u")) {
+      haveVelocity = true;
+      $sponge.getOptionUnits("u", "m/s", $spongeVelRef);
+    } else {
+      std::cerr << "ERROR: must specify 'M' or 'u' for sponge" << std::endl;
+      Loci::Abort();
+    }
+
+    // get mixture if specified, or use default mixture
+    $spongeMixRef.resize($numSpecies, 0.0);
+    if ($sponge.optionExists("mixture")) {
+      if ($sponge.getOptionValueType("mixture") != Loci::LIST) {
+        std::cerr << "'mixture' should be assigned to a species list"
+                  << std::endl;
+        Loci::Abort();
+      } else {
+        Loci::options_list::arg_list species_list;
+        $sponge.getOption("mixture", species_list);
+        Loci::options_list::arg_list::iterator li;
+        for (li = species_list.begin(); li != species_list.end(); ++li) {
+          Loci::option_values::value_list_type species_arg;
+          li->get_value(species_arg);
+          if (li->type_of() != Loci::NAME_ASSIGN || species_arg.size() != 1 ||
+              species_arg.front().type_of() != Loci::REAL) {
+            std::cerr << "error in mixture assignment for sponge" << std::endl;
+            Loci::Abort();
+          } else {
+            std::string speciesName;
+            real speciesValue;
+            li->get_value(speciesName);
+            species_arg.front().get_value(speciesValue);
+            int sid = $qvi.speciesIndex(speciesName);
+            if (sid == -1) {
+              std::cerr << "unable to find species " << speciesName
+                        << std::endl;
+              Loci::Abort();
+            } else
+              $spongeMixRef[sid] = speciesValue;
+          }
+        }
+      }
+    } else {
+      $spongeMixRef = $defaultMixtureFraction;
+    }
+
+    // get flow state
+    EOS::State stateRef;
+    if (havePressure && haveTemperature) {
+      stateRef = $eos.State_from_mixture_p_T(&($spongeMixRef[0]), spongePressure,
+                                             spongeTemperature);
+    } else if (havePressure && haveRho) {
+      std::vector<real> rhoVec = $spongeMixRef;
+      for (unsigned int ii = 0; ii < rhoVec.size(); ++ii) {
+        rhoVec[ii] *= $spongeRhoRef;
+      }
+      stateRef = $eos.State_from_rho_p(&rhoVec[0], spongePressure);
+    } else if (haveRho && haveTemperature) {
+      std::vector<real> rhoVec = $spongeMixRef;
+      for (unsigned int ii = 0; ii < rhoVec.size(); ++ii) {
+        rhoVec[ii] *= $spongeRhoRef;
+      }
+      stateRef = $eos.State_from_rho_T(&rhoVec[0], spongeTemperature);
+    } else {
+      std::cerr << "ERROR: cannot calculate reference state for sponge"
+                << std::endl;
+      Loci::Abort();
+    }
+
+    // get velocity if we don't already have it
+    if (!haveVelocity) {
+      real sos = stateRef.soundSpeed();
+      $spongeVelRef.x = spongeMach.x * sos;
+      $spongeVelRef.y = spongeMach.y * sos;
+      $spongeVelRef.z = spongeMach.z * sos;
+    }
+
+    // get density if we don't already have it
+    if (!haveRho) {
+      $spongeRhoRef = stateRef.density();
+    }
+
+    // get energy
+    $spongeEnergyRef =
+        stateRef.energy() + 0.5 * dot($spongeVelRef, $spongeVelRef);
+  }
+
+} // end chem namespace

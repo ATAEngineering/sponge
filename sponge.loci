@@ -1,0 +1,175 @@
+//#############################################################################
+//#
+//# Copyright 2018, ATA Engineering
+//#
+//# This file is part of the CHEM solver framework.
+//#
+//# The CHEM solver framework is free software: you can redistribute it
+//# and/or modify it under the terms of the Lesser GNU General Public License
+//# as published by the Free Software Foundation, either version 3 of the
+//# License, or (at your option) any later version.
+//#
+//# The CHEM solver is distributed in the hope that it will be useful,
+//# but WITHOUT ANY WARRANTY; without even the implied warranty of
+//# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+//# Lesser GNU General Public License for more details.
+//#
+//# You should have received a copy of the Lesser GNU General Public License
+//# along with the CHEM solver.  If not, see <http://www.gnu.org/licenses>
+//#
+//# NOTICE: The GNU license describes the parameters of your redistribution
+//# rights granted by ATA Engineering but the redistribution
+//# of this software is also constrained by export control laws.  This
+//# software may also be considered as covered by EAR or ITAR regulation
+//# regimes and so it is your responsibility to ensure that this software
+//# is redistributed only to US persons and any redistribution is in
+//# conformance with applicable United States export control laws.
+//#
+//#############################################################################
+
+#include <Loci.h>
+// chem.lh must come before chemio.h
+$include "chem.lh"
+#include "chemio.h"
+#include "eos.h"
+#include "qvi.h"
+
+#include <iostream>
+$include "sponge.lh"
+
+using std::cout;
+using std::cerr;
+using std::endl;
+
+namespace chem {
+  // -------------------------------------------------------------------------
+  // calculate sigma
+  $rule pointwise(spongeSigma <- spongeSigmaMax, distFromSpongeBC, 
+                  spongeLength) {
+    const real normDist = $distFromSpongeBC / $spongeLength;
+    $spongeSigma = ($distFromSpongeBC > $spongeLength)
+                       ? 0.0
+                       : $spongeSigmaMax * (1.0 - normDist);
+  }
+
+  $type spongeSigma_f store<real>;
+  $rule pointwise(spongeSigma_f <- distFromSpongeBC_f, spongeLength, 
+                  spongeSigmaMax) {
+    const real normDist = $distFromSpongeBC_f / $spongeLength;
+    $spongeSigma_f = ($distFromSpongeBC_f > $spongeLength)
+                       ? 0.0
+                       : $spongeSigmaMax * (1.0 - normDist);
+  } 
+
+  OUTPUT_SCALAR("cell2node(spongeSigma)", spongeSigma);
+
+  // -------------------------------------------------------------------------
+  // add in sponge source terms
+  $rule apply(src <- qvi, vol, spongeRhoRef, spongeVelRef, spongeMixRef, 
+              spongeEnergyRef, spongeSigma, eos, u, mixture, pressure,
+              temperature) [Loci::Summation] {
+    // get flow state
+    EOS::State flowState =
+        $eos.State_from_mixture_p_T($mixture, $pressure, $temperature);
+    real density = flowState.density();
+    real energy = flowState.energy() + 0.5 * dot($u, $u);
+
+    // mass source terms
+    const int ns = $qvi.numSpecies();
+    for (int ii = 0; ii < ns; ++ii) {
+      $src[ii] += $vol * $spongeSigma *
+                  ($spongeRhoRef * $spongeMixRef[ii] - density * $mixture[ii]);
+    }
+
+    // momentum source terms
+    const int mi = $qvi.momentumIndex();
+    $src[mi + 0] += $vol * $spongeSigma *
+                    ($spongeRhoRef * $spongeVelRef.x - density * $u.x);
+    $src[mi + 1] += $vol * $spongeSigma *
+                    ($spongeRhoRef * $spongeVelRef.y - density * $u.y);
+    $src[mi + 2] += $vol * $spongeSigma *
+                    ($spongeRhoRef * $spongeVelRef.z - density * $u.z);
+    
+    // energy source terms
+    const int ei = $qvi.totalEnergyIndex();
+    $src[ei] += $vol * $spongeSigma *
+                ($spongeRhoRef * $spongeEnergyRef - density * energy);
+  }
+
+  // -------------------------------------------------------------------------
+  // add in sponge source jacobians
+  $rule apply(pc_srcJ <- qvi, vol, spongeSigma, eos, u, mixture, pressure, 
+              temperature) [Loci::Summation],
+              constraint(geom_cells, rhop_primitive) {
+    // get flow state
+    EOS::State flowState =
+        $eos.State_from_mixture_p_T($mixture, $pressure, $temperature);
+    real density = flowState.density();
+
+    const int ns = $qvi.numSpecies();
+    const int mi = $qvi.momentumIndex();
+    const int ei = $qvi.totalEnergyIndex();
+
+    // -= because form of source term is sigma * (Ref - X) where X is the flow
+    // conditions in the cell
+    // jacobian is of the form d_conserved / d_primitive * sigma
+    for (int ii = 0; ii < ns; ++ii) {
+      $pc_srcJ[ii][ii] -= $spongeSigma * $vol;
+      $pc_srcJ[mi + 0][ii] -= $spongeSigma * $u.x * $vol;
+      $pc_srcJ[mi + 1][ii] -= $spongeSigma * $u.y * $vol;
+      $pc_srcJ[mi + 2][ii] -= $spongeSigma * $u.z * $vol;
+      $pc_srcJ[ei][ii] -= $spongeSigma * 0.5 * dot($u, $u) * $vol;
+    }
+    $pc_srcJ[mi + 0][mi + 0] -= $spongeSigma * density * $vol;
+    $pc_srcJ[mi + 1][mi + 1] -= $spongeSigma * density * $vol;
+    $pc_srcJ[mi + 2][mi + 2] -= $spongeSigma * density * $vol;
+
+    $pc_srcJ[ei][mi + 0] -= $spongeSigma * density * $u.x * $vol;
+    $pc_srcJ[ei][mi + 1] -= $spongeSigma * density * $u.y * $vol;
+    $pc_srcJ[ei][mi + 2] -= $spongeSigma * density * $u.z * $vol;
+    $pc_srcJ[ei][ei] -= $spongeSigma / (flowState.Gamma() - 1.0) * $vol;
+  }
+
+  $rule apply(pc_srcJ <- qvi, vol, spongeSigma, eos, u, mixture, pressure,
+              temperature) [Loci::Summation],
+              constraint(geom_cells, pt_primitive) {
+    // get flow state
+    EOS::State flowState =
+        $eos.State_from_mixture_p_T($mixture, $pressure, $temperature);
+    real density = flowState.density();
+    real energy = flowState.energy() + 0.5 * dot($u, $u);
+
+    const int ns = $qvi.numSpecies();
+    const int mi = $qvi.momentumIndex();
+    const int ei = $qvi.totalEnergyIndex();
+    const int ti = $qvi.temperatureIndex();
+
+    // -= because form of source term is sigma * (Ref - X) where X is the flow
+    // conditions in the cell
+    // jacobian is of the form d_conserved / d_primitive * sigma
+    for (int ii = 0; ii < ns; ++ii) {
+      $pc_srcJ[ii][ii] -= $spongeSigma * density * $vol;
+      $pc_srcJ[mi + 0][ii] -= $spongeSigma * density * $u.x / $pressure * $vol;
+      $pc_srcJ[mi + 1][ii] -= $spongeSigma * density * $u.y / $pressure * $vol;
+      $pc_srcJ[mi + 2][ii] -= $spongeSigma * density * $u.z / $pressure * $vol;
+      $pc_srcJ[ti][ii] -= $spongeSigma * density * energy / $pressure * $vol;
+    }
+
+    $pc_srcJ[ei][ei] -= $spongeSigma * density / $pressure * $vol;
+    $pc_srcJ[ei][ti] += $spongeSigma * density / $temperature * $vol;
+
+    $pc_srcJ[mi + 0][mi + 0] -= $spongeSigma * density * $vol;
+    $pc_srcJ[mi + 0][ti] += $spongeSigma * density * $u.x / $temperature * $vol;
+    $pc_srcJ[mi + 1][mi + 1] -= $spongeSigma * density * $vol;
+    $pc_srcJ[mi + 1][ti] += $spongeSigma * density * $u.y / $temperature * $vol;
+    $pc_srcJ[mi + 2][mi + 2] -= $spongeSigma * density * $vol;
+    $pc_srcJ[mi + 2][ti] += $spongeSigma * density * $u.z / $temperature * $vol;
+
+    $pc_srcJ[ti][mi + 0] -= $spongeSigma * density * $u.x * $vol;
+    $pc_srcJ[ti][mi + 1] -= $spongeSigma * density * $u.y * $vol;
+    $pc_srcJ[ti][mi + 2] -= $spongeSigma * density * $u.z * $vol;
+    $pc_srcJ[ti][ti] +=
+        $spongeSigma * density * 0.5 * dot($u, $u) / $temperature * $vol;
+  }
+
+}

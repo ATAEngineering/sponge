@@ -1,0 +1,129 @@
+// Copyright (C) 2019, ATA Engineering, Inc.
+// 
+// This program is free software; you can redistribute it and/or
+// modify it under the terms of the GNU Lesser General Public
+// License as published by the Free Software Foundation; either
+// version 3 of the License, or (at your option) any later version.
+// 
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+// Lesser General Public License for more details.
+// 
+// You should have received a copy of the GNU Lesser General Public License
+// along with this program; if not, write to the Free Software Foundation,
+// Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.
+
+
+#include <Loci.h>
+$include "FVM.lh"
+// chem.lh must come before chemio.h
+$include "chem.lh"
+#include "chemio.h"
+#include "read_grid.h"
+
+#include <iostream>
+#include <vector>
+$include "sponge.lh"
+#include "vectorUtils.hpp"
+
+using std::cout;
+using std::cerr;
+using std::endl;
+
+namespace chem {
+  // -------------------------------------------------------------------------
+  std::vector<Loci::kdTree::coord3d> get_sponge_data(
+      Loci::fact_db &facts, std::vector<int> &sponge_ids) {
+    Map ref(facts.get_variable("ref"));
+    Loci::entitySet refSet = ref.domain();
+    Loci::entitySet spongeSet = facts.get_variable("sponge_BCoption")->domain();
+
+    Loci::entitySet sponge_faces;
+    FORALL(refSet, rc) {
+      if (spongeSet.inSet(ref[rc])) {
+        sponge_faces += rc;
+      }
+    } ENDFORALL;
+
+    std::vector<Loci::kdTree::coord3d> sponge_pts_loc(sponge_faces.size());
+    std::vector<int> sponge_ids_loc(sponge_faces.size());
+    store<vect3d> facecenter(facts.get_variable("facecenter"));
+    int cnt = 0;
+    FORALL(sponge_faces, fc) {
+      sponge_pts_loc[cnt][0] = facecenter[fc].x;
+      sponge_pts_loc[cnt][1] = facecenter[fc].y;
+      sponge_pts_loc[cnt][2] = facecenter[fc].z;
+      sponge_ids_loc[cnt] = fc;
+      cnt++;
+    } ENDFORALL;
+
+    // gather ids and points
+    AllGatherVector(sponge_ids, sponge_ids_loc, MPI_COMM_WORLD);
+    std::vector<Loci::kdTree::coord3d> sponge_pts(sponge_faces.size());
+    AllGatherVector(sponge_pts, sponge_pts_loc, MPI_COMM_WORLD);
+
+    return sponge_pts;
+  }
+
+  // get sponge faces and ids and communicate them to all processors
+  $type spongeFaces param<std::vector<Loci::kdTree::coord3d> >;
+  $type spongeIds param<std::vector<int> >;
+  $rule singleton(spongeFaces, spongeIds <- cellcenter) {
+    Loci::fact_db *factsP = Loci::exec_current_fact_db;
+    $spongeFaces = get_sponge_data(*factsP, $spongeIds);
+  }
+
+
+  // calculate distance from cell center to sponge BC
+  $rule pointwise(distFromSpongeBC <- cellcenter, spongeFaces, spongeIds), 
+    constraint(geom_cells), prelude {
+    Loci::entitySet dom = $cellcenter.domain();
+    std::vector<Loci::kdTree::coord3d> cell_pts(dom.size());
+    int cnt = 0;
+    FORALL(dom, cc) {
+      cell_pts[cnt][0] = $cellcenter[cc].x;
+      cell_pts[cnt][1] = $cellcenter[cc].y;
+      cell_pts[cnt][2] = $cellcenter[cc].z;
+      cnt++;
+    } ENDFORALL;
+
+    std::vector<int> closest(dom.size(), -1);
+    Loci::parallelNearestNeighbors(*$spongeFaces, *$spongeIds, cell_pts,
+                                   closest, MPI_COMM_WORLD);
+
+    Map min_cell2sponge;
+    min_cell2sponge.allocate(dom);
+    cnt = 0;
+    FORALL(dom, cc) {
+      std::vector<int>::const_iterator it =
+          std::find((*$spongeIds).begin(), (*$spongeIds).end(), closest[cnt]);
+      int id = std::distance((*$spongeIds).begin(), it);
+      min_cell2sponge[cc] = id;
+      cnt++;
+    } ENDFORALL;
+
+    $distFromSpongeBC.allocate(dom);
+    FORALL(dom, cc) {
+      vect3d facec = (*$spongeFaces)[min_cell2sponge[cc]];
+      vect3d cellc = $cellcenter[cc];
+      vect3d dist = facec - cellc;
+      $distFromSpongeBC[cc] = norm(dist);
+    } ENDFORALL;
+  };
+
+  // for boundary faces, just use interior cell distance
+  $rule pointwise(distFromSpongeBC_f <- ci->distFromSpongeBC) {
+    $distFromSpongeBC_f = $ci->$distFromSpongeBC;
+  }
+  
+  // at sponge BC, distance from sponge is zero
+  $rule pointwise(priority::distFromSpongeBC_f), 
+    constraint(ref->sponge_BCoption) {
+    $distFromSpongeBC_f = 0.0;
+  }
+
+  OUTPUT_SCALAR("cell2node(distFromSpongeBC)", spongeDistance);
+
+
+}
